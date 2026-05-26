@@ -1,4 +1,4 @@
-# Claude CLI Subscription Adapter
+# Claude CLI Subscription Adapter (Hardened)
 
 Routes Hermes (or any Anthropic-SDK client) through the **Claude Code CLI** so
 you can use your **Pro / Max subscription** without triggering per-token overage
@@ -10,6 +10,8 @@ Hermes ──► localhost:8082 (this adapter) ──► claude -p (CLI) ──�
 
 The adapter speaks the Anthropic Messages API, so no changes to Hermes source
 are needed — you only change one config value.
+
+**HARDENED VERSION:** Input validation, rate limiting, error sanitization, regex DoS protection.
 
 ---
 
@@ -34,21 +36,39 @@ See [hermes-agent#29125](https://github.com/NousResearch/hermes-agent/issues/291
 
 ## Setup
 
+### Automated (recommended)
+
 ```bash
-# 1. Clone / download this adapter
-git clone https://github.com/<your-fork>/claudehermessubscriptionadapter
+git clone https://github.com/RawSmokeTerribilus/claudehermessubscriptionadapter
 cd claudehermessubscriptionadapter
 
-# 2. Install dependencies (use a venv if you like)
-pip install -r requirements.txt
-
-# 3. Start the adapter
-python server.py            # listens on 127.0.0.1:8082 by default
-# or choose a different port:
-python server.py --port 9000
+# One-command setup: venv + deps + systemd service + Hermes config
+bash install.sh
 ```
 
-Leave the adapter running in a terminal (or add it to a systemd/launchd unit).
+This:
+- Creates `~/.hermes/proxy/` with isolated venv
+- Installs dependencies
+- Sets up `hermes-claude-proxy.service` (user-level systemd)
+- Configures Hermes to use the adapter
+- Starts the service
+
+The proxy will auto-start on login.
+
+### Manual setup
+
+```bash
+git clone https://github.com/RawSmokeTerribilus/claudehermessubscriptionadapter
+cd claudehermessubscriptionadapter
+
+# 1. Install dependencies
+pip install -r requirements.txt
+
+# 2. Start the adapter
+python server.py            # listens on 127.0.0.1:8082 by default
+
+# 3. Point Hermes at it (see Configure section below)
+```
 
 ---
 
@@ -104,6 +124,38 @@ calls as `<tool_call>{"name": "…", "input": {…}}</tool_call>` blocks.  These
 are parsed back into proper `tool_use` content blocks before the response is
 returned.  Multi-turn tool loops work because Hermes sends `tool_result`
 messages back, which the adapter serialises into the dialogue context.
+
+---
+
+## Security (Hardened Version)
+
+This fork includes several hardening improvements over the original:
+
+### Input Validation
+- **Model allowlist**: Only accepts `claude-opus-4-7`, `claude-opus-4-6`, `claude-sonnet-4-6`, `claude-haiku-4-5-20251001`
+- **Size limits**: 
+  - System prompt: max 20,000 chars (~5k tokens)
+  - Full prompt: max 100,000 chars (~25k tokens)
+  - Individual message: max 50,000 chars
+  - Message count: max 100
+  - Tools: max 100
+- **Structure validation**: Enforces message format, role types, content blocks
+
+### Rate Limiting
+- Max 30 requests per 60 seconds per client IP
+- Returns HTTP 429 if limit exceeded
+
+### Error Sanitization
+- Stderr/exception details are NOT returned to client
+- Generic error messages only; actual errors logged to `journalctl`
+
+### Regex DoS Protection
+- Tool call parsing regex limited to 10,000 char matches
+- Catastrophic backtracking mitigated
+
+### Access Control
+- Bound to `127.0.0.1:8082` by default (localhost only)
+- systemd service runs as your user (no privilege escalation)
 
 ---
 

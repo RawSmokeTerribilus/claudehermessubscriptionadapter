@@ -1,0 +1,20 @@
+[Unit]
+Description=Claude CLI Subscription Adapter (Hermes Proxy)
+Documentation=https://github.com/RawSmokeTerribilus/claudehermessubscriptionadapter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=%u
+WorkingDirectory=%h/.hermes/proxy
+ExecStart=%h/.hermes/proxy/venv/bin/python %h/.hermes/proxy/server.py --host 127.0.0.1 --port 8082
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=hermes-proxy
+Environment="PATH=%h/.hermes/proxy/venv/bin:/usr/local/bin:/usr/bin"
+
+[Install]
+WantedBy=default.target

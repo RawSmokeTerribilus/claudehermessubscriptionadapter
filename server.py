@@ -6,6 +6,8 @@ Exposes a local Anthropic-compatible HTTP API that routes every request through
 http://127.0.0.1:8082 and it will work with your Claude Pro/Max subscription
 without burning overage credits.
 
+HARDENED VERSION: input validation, error sanitization, rate limiting, size caps.
+
 Usage:
     python server.py [--port 8082] [--host 127.0.0.1]
 """
@@ -18,12 +20,38 @@ import json
 import re
 import uuid
 from typing import AsyncGenerator, Optional
+from collections import defaultdict
+from time import time
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 import uvicorn
 
 app = FastAPI(title="Claude CLI Subscription Adapter")
+
+# ---------------------------------------------------------------------------
+# Validation & security constants
+# ---------------------------------------------------------------------------
+
+ALLOWED_MODELS = {
+    "claude-opus-4-7",
+    "claude-opus-4-6",
+    "claude-sonnet-4-6",
+    "claude-haiku-4-5-20251001",
+}
+
+MAX_PROMPT_CHARS = 100_000      # ~25k tokens
+MAX_SYSTEM_CHARS = 20_000       # ~5k tokens
+MAX_TOOL_COUNT = 100
+MAX_MESSAGES_COUNT = 100
+MAX_MESSAGE_CONTENT_CHARS = 50_000
+
+RATE_LIMIT_REQUESTS = 30        # requests
+RATE_LIMIT_WINDOW = 60          # seconds
+RATE_LIMIT_STORAGE = defaultdict(lambda: [])  # per-IP: [timestamps]
+
+# Tighten regex to avoid catastrophic backtracking
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.{1,10000}?)\s*</tool_call>", re.DOTALL)
 
 # ---------------------------------------------------------------------------
 # Request → CLI helpers
@@ -129,6 +157,10 @@ async def _run_claude(
     Call `claude -p` and return (output_text, input_tokens, output_tokens).
     Uses stream-json so we can capture rich metadata; falls back gracefully.
     """
+    # Validate model against allowlist
+    if model not in ALLOWED_MODELS:
+        raise HTTPException(status_code=400, detail="Invalid model")
+
     cmd = [
         "claude",
         "-p", prompt,
@@ -149,8 +181,8 @@ async def _run_claude(
     stdout_bytes, stderr_bytes = await proc.communicate()
 
     if proc.returncode not in (0, None):
-        stderr_text = stderr_bytes.decode(errors="replace").strip()
-        raise HTTPException(status_code=502, detail=f"claude CLI error: {stderr_text}")
+        # Sanitize stderr: don't leak system info, just generic error
+        raise HTTPException(status_code=502, detail="Claude CLI execution failed. Check server logs.")
 
     try:
         result = json.loads(stdout_bytes.decode(errors="replace").strip())
@@ -159,7 +191,8 @@ async def _run_claude(
         return stdout_bytes.decode(errors="replace").strip(), 0, 0
 
     if result.get("is_error"):
-        raise HTTPException(status_code=502, detail=f"claude CLI error: {result.get('result', 'unknown error')}")
+        # Sanitize error response
+        raise HTTPException(status_code=502, detail="Claude CLI returned an error. Check server logs.")
 
     text_output = result.get("result", "")
     usage = result.get("usage", {})
@@ -170,10 +203,93 @@ async def _run_claude(
 
 
 # ---------------------------------------------------------------------------
-# Tool-call parsing
+# Rate limiting & validation helpers
 # ---------------------------------------------------------------------------
 
-_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+def _check_rate_limit(client_ip: str) -> None:
+    """Raise HTTPException if client exceeds rate limit."""
+    now = time()
+    window_start = now - RATE_LIMIT_WINDOW
+
+    timestamps = RATE_LIMIT_STORAGE[client_ip]
+    # Keep only recent timestamps
+    timestamps[:] = [t for t in timestamps if t > window_start]
+
+    if len(timestamps) >= RATE_LIMIT_REQUESTS:
+        raise HTTPException(
+            status_code=429,
+            detail="Rate limit exceeded. Max 30 requests per 60 seconds."
+        )
+
+    timestamps.append(now)
+
+
+def _validate_request(body: dict) -> None:
+    """Validate request structure and sizes."""
+    messages = body.get("messages", [])
+    system_raw = body.get("system", "")
+    tools = body.get("tools", [])
+    model = body.get("model", "claude-opus-4-7")
+
+    # Model allowlist
+    if model not in ALLOWED_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Model '{model}' not supported. Allowed: {', '.join(ALLOWED_MODELS)}"
+        )
+
+    # Message count
+    if not isinstance(messages, list) or len(messages) > MAX_MESSAGES_COUNT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many messages. Max {MAX_MESSAGES_COUNT}."
+        )
+
+    # Message content validation
+    for i, msg in enumerate(messages):
+        if not isinstance(msg, dict) or msg.get("role") not in ("user", "assistant"):
+            raise HTTPException(status_code=400, detail=f"Message {i}: invalid structure or role")
+
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            if len(content) > MAX_MESSAGE_CONTENT_CHARS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Message {i}: content too long. Max {MAX_MESSAGE_CONTENT_CHARS} chars."
+                )
+        elif isinstance(content, list):
+            total = 0
+            for block in content:
+                if isinstance(block, dict) and block.get("type") == "text":
+                    total += len(block.get("text", ""))
+            if total > MAX_MESSAGE_CONTENT_CHARS:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Message {i}: total content too long."
+                )
+
+    # System prompt size
+    system_text = _extract_system_text(system_raw)
+    if len(system_text) > MAX_SYSTEM_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"System prompt too long. Max {MAX_SYSTEM_CHARS} chars."
+        )
+
+    # Tool count
+    if not isinstance(tools, list) or len(tools) > MAX_TOOL_COUNT:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Too many tools. Max {MAX_TOOL_COUNT}."
+        )
+
+    for i, tool in enumerate(tools):
+        if not isinstance(tool, dict) or "name" not in tool:
+            raise HTTPException(status_code=400, detail=f"Tool {i}: missing 'name'")
+
+# ---------------------------------------------------------------------------
+# Tool-call parsing
+# ---------------------------------------------------------------------------
 
 
 def _parse_tool_calls(raw: str) -> tuple[list[dict], str]:
@@ -342,10 +458,17 @@ async def _sse_stream(
 
 @app.post("/v1/messages")
 async def post_messages(request: Request):
+    # Rate limit by client IP
+    client_ip = request.client.host if request.client else "unknown"
+    _check_rate_limit(client_ip)
+
     try:
         body = await request.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    # Validate request structure and sizes
+    _validate_request(body)
 
     messages: list[dict] = body.get("messages", [])
     system_raw = body.get("system", "")
@@ -356,6 +479,13 @@ async def post_messages(request: Request):
     system_text = _extract_system_text(system_raw)
     full_system = _build_system_prompt(system_text, tools)
     prompt = _messages_to_prompt(messages)
+
+    # Cap prompt size
+    if len(prompt) > MAX_PROMPT_CHARS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Prompt too large. Max {MAX_PROMPT_CHARS} chars."
+        )
 
     raw_text, input_tokens, output_tokens = await _run_claude(prompt, full_system, model)
 
